@@ -216,6 +216,10 @@ void validateDecodeUnitForPlayback(PDECODE_UNIT decodeUnit) {
             // We don't parse the AV1 bitstream
             LC_ASSERT_VT(decodeUnit->bufferList->bufferType == BUFFER_TYPE_PICDATA);
         }
+        else if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) {
+            // We don't parse the PyroWave bitstream
+            LC_ASSERT_VT(decodeUnit->bufferList->bufferType == BUFFER_TYPE_PICDATA);
+        }
         else {
             LC_ASSERT(false);
         }
