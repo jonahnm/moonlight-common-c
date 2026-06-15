@@ -230,6 +230,86 @@ int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect) {
     return err;
 }
 
+// recvmmsg() lets us drain many datagrams from the socket in a single syscall,
+// which is essential at high bitrates/framerates where the per-packet syscall
+// overhead otherwise prevents the receive thread from keeping up and causes
+// kernel receive buffer overflow (RcvbufErrors).
+#if defined(__linux__)
+#define HAS_RECVMMSG 1
+#endif
+
+int recvMultiUdpSocket(SOCKET s, char** recvBuffers, int* lengths, int maxPackets, int eachSize, bool useSelect) {
+#if defined(HAS_RECVMMSG)
+    int err;
+    struct mmsghdr msgs[MAX_RECV_BATCH_SIZE];
+    struct iovec iovs[MAX_RECV_BATCH_SIZE];
+
+    if (maxPackets > MAX_RECV_BATCH_SIZE) {
+        maxPackets = MAX_RECV_BATCH_SIZE;
+    }
+
+    memset(msgs, 0, sizeof(msgs[0]) * maxPackets);
+    for (int i = 0; i < maxPackets; i++) {
+        iovs[i].iov_base = recvBuffers[i];
+        iovs[i].iov_len = eachSize;
+        msgs[i].msg_hdr.msg_iov = &iovs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+
+    do {
+        if (useSelect) {
+            struct pollfd pfd;
+
+            // Wait up to 100 ms for the socket to be readable
+            pfd.fd = s;
+            pfd.events = POLLIN;
+            err = pollSockets(&pfd, 1, UDP_RECV_POLL_TIMEOUT_MS);
+            if (err <= 0) {
+                // Return if an error or timeout occurs
+                return err;
+            }
+
+            // Drain whatever is available without blocking
+            err = recvmmsg(s, msgs, maxPackets, MSG_DONTWAIT, NULL);
+        }
+        else {
+            // SO_RCVTIMEO governs the blocking wait for the first datagram;
+            // MSG_WAITFORONE returns any further datagrams that are immediately
+            // available without blocking again.
+            err = recvmmsg(s, msgs, maxPackets, MSG_WAITFORONE, NULL);
+        }
+
+        if (err < 0 &&
+                (LastSocketError() == EWOULDBLOCK ||
+                 LastSocketError() == EINTR ||
+                 LastSocketError() == EAGAIN ||
+                 LastSocketError() == ETIMEDOUT)) {
+            // Return 0 for timeout
+            return 0;
+        }
+
+    // We may receive an error due to a previous ICMP Port Unreachable error received
+    // by this socket. We want to ignore those and continue reading.
+    } while (err < 0 && LastSocketError() == ECONNREFUSED);
+
+    if (err > 0) {
+        for (int i = 0; i < err; i++) {
+            lengths[i] = (int)msgs[i].msg_len;
+        }
+    }
+
+    return err;
+#else
+    // Platforms without recvmmsg() receive a single datagram per call.
+    int err = recvUdpSocket(s, recvBuffers[0], eachSize, useSelect);
+    if (err <= 0) {
+        return err;
+    }
+    lengths[0] = err;
+    return 1;
+#endif
+}
+
 void closeSocket(SOCKET s) {
 #if defined(LC_WINDOWS)
     closesocket(s);

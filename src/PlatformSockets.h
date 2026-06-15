@@ -106,6 +106,17 @@ SOCKET bindUdpSocket(int addressFamily, struct sockaddr_storage* localAddr, SOCK
 int enableNoDelay(SOCKET s);
 int setSocketNonBlocking(SOCKET s, bool enabled);
 int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect);
+
+// Maximum number of datagrams that recvMultiUdpSocket() can return in one call.
+#define MAX_RECV_BATCH_SIZE 32
+
+// Receives up to maxPackets datagrams in a single syscall where the platform
+// supports it (recvmmsg on Linux/Android), falling back to a single recvfrom()
+// elsewhere. recvBuffers[i] receives datagram i (up to eachSize bytes) and
+// lengths[i] is set to its length. Returns the number of datagrams received,
+// 0 on timeout, or <0 on error.
+int recvMultiUdpSocket(SOCKET s, char** recvBuffers, int* lengths, int maxPackets, int eachSize, bool useSelect);
+
 void shutdownTcpSocket(SOCKET s);
 int setNonFatalRecvTimeoutMs(SOCKET s, int timeoutMs);
 void closeSocket(SOCKET s);

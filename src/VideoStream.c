@@ -1,4 +1,17 @@
+// _GNU_SOURCE must be defined before any include for the CPU affinity macros
+// (cpu_set_t, CPU_SET, sched_setaffinity) to be visible on bionic/glibc.
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include "Limelight-internal.h"
+
+#if defined(__linux__)
+#include <sched.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#include <stdio.h>
+#endif
 
 #define FIRST_FRAME_MAX 1500
 #define FIRST_FRAME_TIMEOUT_SEC 10
@@ -81,12 +94,78 @@ static void VideoPingThreadProc(void* context) {
     }
 }
 
+// Raise the receive thread's scheduling priority and pin it to the fastest CPU
+// cores. At high bitrates the receive thread must drain the UDP socket faster
+// than packets arrive during bursts; if the scheduler preempts it or parks it on
+// a slow (LITTLE) core, the kernel receive buffer overflows and packets are lost.
+// All operations here are best-effort: failures (e.g. lacking permission to renice
+// or no big.LITTLE topology) are harmless and ignored.
+static void optimizeReceiveThreadScheduling(void) {
+#if defined(__linux__)
+    // Raise priority (lower nice). Apps can renice their own threads within the
+    // limit set by RLIMIT_NICE; if not permitted, this simply fails and is ignored.
+    setpriority(PRIO_PROCESS, (id_t)gettid(), -10);
+
+    // Find the highest CPU max frequency and pin to all cores running at it
+    // (the "big" cluster on big.LITTLE designs).
+    long cpuCount = sysconf(_SC_NPROCESSORS_CONF);
+    if (cpuCount <= 1 || cpuCount > CPU_SETSIZE) {
+        return;
+    }
+
+    long maxFreq = 0;
+    long freqs[CPU_SETSIZE] = { 0 };
+    for (long i = 0; i < cpuCount; i++) {
+        char path[128];
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", i);
+        FILE* f = fopen(path, "r");
+        if (f != NULL) {
+            if (fscanf(f, "%ld", &freqs[i]) != 1) {
+                freqs[i] = 0;
+            }
+            fclose(f);
+        }
+        if (freqs[i] > maxFreq) {
+            maxFreq = freqs[i];
+        }
+    }
+
+    if (maxFreq <= 0) {
+        // Couldn't read topology; leave affinity untouched.
+        return;
+    }
+
+    cpu_set_t cpus;
+    CPU_ZERO(&cpus);
+    int bigCores = 0;
+    for (long i = 0; i < cpuCount; i++) {
+        if (freqs[i] == maxFreq) {
+            CPU_SET(i, &cpus);
+            bigCores++;
+        }
+    }
+
+    // Only bind if this is a heterogeneous (big.LITTLE) topology; pinning to all
+    // cores on a homogeneous CPU would be pointless and just reduce flexibility.
+    if (bigCores > 0 && bigCores < cpuCount) {
+        sched_setaffinity(gettid(), sizeof(cpus), &cpus);
+    }
+#endif
+}
+
 // Receive thread proc
 static void VideoReceiveThreadProc(void* context) {
+    optimizeReceiveThreadScheduling();
+
     int err;
     int bufferSize, receiveSize, decryptedSize, minSize;
-    char* buffer;
-    char* encryptedBuffer;
+    // Per-packet output buffers (may be handed off to the RTP queue) and, for
+    // encrypted streams, scratch buffers to receive the ciphertext into.
+    char* buffers[MAX_RECV_BATCH_SIZE] = { 0 };
+    char* encryptedBuffers[MAX_RECV_BATCH_SIZE] = { 0 };
+    char* recvTargets[MAX_RECV_BATCH_SIZE];
+    int lengths[MAX_RECV_BATCH_SIZE];
     int queueStatus;
     bool useSelect;
     int waitingForVideoMs;
@@ -94,10 +173,9 @@ static void VideoReceiveThreadProc(void* context) {
 
     encrypted = !!(EncryptionFeaturesEnabled & SS_ENC_VIDEO);
     decryptedSize = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE;
-    minSize = sizeof(RTP_PACKET) + ((EncryptionFeaturesEnabled & SS_ENC_VIDEO) ? sizeof(ENC_VIDEO_HEADER) : 0);
-    receiveSize = decryptedSize + ((EncryptionFeaturesEnabled & SS_ENC_VIDEO) ? sizeof(ENC_VIDEO_HEADER) : 0);
+    minSize = sizeof(RTP_PACKET) + (encrypted ? sizeof(ENC_VIDEO_HEADER) : 0);
+    receiveSize = decryptedSize + (encrypted ? sizeof(ENC_VIDEO_HEADER) : 0);
     bufferSize = decryptedSize + sizeof(RTPV_QUEUE_ENTRY);
-    buffer = NULL;
 
     if (setNonFatalRecvTimeoutMs(rtpSocket, UDP_RECV_POLL_TIMEOUT_MS) < 0) {
         // SO_RCVTIMEO failed, so use select() to wait
@@ -108,42 +186,46 @@ static void VideoReceiveThreadProc(void* context) {
         useSelect = false;
     }
 
-    // Allocate a staging buffer to use for each received packet
+    // For encrypted streams, allocate a ciphertext scratch buffer per batch slot.
+    // These are reused for the life of the thread (decryption writes plaintext
+    // into the matching per-packet output buffer).
     if (encrypted) {
-        encryptedBuffer = (char*)malloc(receiveSize);
-        if (encryptedBuffer == NULL) {
-            Limelog("Video Receive: malloc() failed\n");
-            ListenerCallbacks.connectionTerminated(-1);
-            return;
+        for (int i = 0; i < MAX_RECV_BATCH_SIZE; i++) {
+            encryptedBuffers[i] = (char*)malloc(receiveSize);
+            if (encryptedBuffers[i] == NULL) {
+                Limelog("Video Receive: malloc() failed\n");
+                ListenerCallbacks.connectionTerminated(-1);
+                goto Cleanup;
+            }
         }
-    }
-    else {
-        encryptedBuffer = NULL;
     }
 
     waitingForVideoMs = 0;
     while (!PltIsThreadInterrupted(&receiveThread)) {
-        PRTP_PACKET packet;
+        int numPackets;
 
-        if (buffer == NULL) {
-            buffer = (char*)malloc(bufferSize);
-            if (buffer == NULL) {
-                Limelog("Video Receive: malloc() failed\n");
-                ListenerCallbacks.connectionTerminated(-1);
-                break;
+        // Ensure every batch slot has an output buffer and point the receive
+        // target at the ciphertext scratch (encrypted) or the output buffer.
+        for (int i = 0; i < MAX_RECV_BATCH_SIZE; i++) {
+            if (buffers[i] == NULL) {
+                buffers[i] = (char*)malloc(bufferSize);
+                if (buffers[i] == NULL) {
+                    Limelog("Video Receive: malloc() failed\n");
+                    ListenerCallbacks.connectionTerminated(-1);
+                    goto Cleanup;
+                }
             }
+            recvTargets[i] = encrypted ? encryptedBuffers[i] : buffers[i];
         }
 
-        err = recvUdpSocket(rtpSocket,
-                            encrypted ? encryptedBuffer : buffer,
-                            receiveSize,
-                            useSelect);
-        if (err < 0) {
-            Limelog("Video Receive: recvUdpSocket() failed: %d\n", (int)LastSocketError());
+        numPackets = recvMultiUdpSocket(rtpSocket, recvTargets, lengths,
+                                        MAX_RECV_BATCH_SIZE, receiveSize, useSelect);
+        if (numPackets < 0) {
+            Limelog("Video Receive: recvMultiUdpSocket() failed: %d\n", (int)LastSocketError());
             ListenerCallbacks.connectionTerminated(LastSocketFail());
             break;
         }
-        else if  (err == 0) {
+        else if (numPackets == 0) {
             if (!receivedDataFromPeer) {
                 // If we wait many seconds without ever receiving a video packet,
                 // assume something is broken and terminate the connection.
@@ -154,7 +236,7 @@ static void VideoReceiveThreadProc(void* context) {
                     break;
                 }
             }
-            
+
             // Receive timed out; try again
             continue;
         }
@@ -178,71 +260,80 @@ static void VideoReceiveThreadProc(void* context) {
         }
 #endif
 
-        if (err < minSize) {
-            // Runt packet
-            continue;
-        }
+        for (int i = 0; i < numPackets; i++) {
+            PRTP_PACKET packet;
+            char* buffer = buffers[i];
 
-        // Decrypt the packet into the buffer if encryption is enabled
-        if (encrypted) {
-            PENC_VIDEO_HEADER encHeader = (PENC_VIDEO_HEADER)encryptedBuffer;
+            err = lengths[i];
 
-            // If this frame is below our current frame number, discard it before decryption
-            // to save CPU cycles decrypting FEC shards for a frame we already reassembled.
-            //
-            // Since this is happening _before_ decryption, this packet is not trusted yet.
-            // It's imperative that we do not mutate any state based on this packet until
-            // after it has been decrypted successfully!
-            //
-            // It's possible for an attacker to inject a fake packet that has any value of
-            // header fields they want, however this provides them no benefit because we will
-            // simply drop said packet here (if it's below the current frame number) or it
-            // will pass this check and be dropped during decryption (if contents is tampered)
-            // or after decryption in the RTP queue (if it's a replay of a previous authentic
-            // packet from the host).
-            //
-            // In short, an attacker spoofing this value via MITM or sending malicious values
-            // impersonating the host from off-link doesn't gain them anything. If they have
-            // a true MITM, they can DoS our connection by just dropping all our traffic, so
-            // tampering with packets to fail this check doesn't accomplish anything they
-            // couldn't already do. If they're not on-link, we just throw their malicious
-            // traffic away (as mentioned in the paragraph above) and continue accepting
-            // legitmate video traffic.
-            if (encHeader->frameNumber && LE32(encHeader->frameNumber) < RtpvGetCurrentFrameNumber(&rtpQueue)) {
+            if (err < minSize) {
+                // Runt packet
                 continue;
             }
 
-            if (!PltDecryptMessage(decryptionCtx, ALGORITHM_AES_GCM, 0,
-                                   (unsigned char*)StreamConfig.remoteInputAesKey, sizeof(StreamConfig.remoteInputAesKey),
-                                   encHeader->iv, sizeof(encHeader->iv),
-                                   encHeader->tag, sizeof(encHeader->tag),
-                                   ((unsigned char*)(encHeader + 1)), err - sizeof(ENC_VIDEO_HEADER), // The ciphertext is after the header
-                                   (unsigned char*)buffer, &err)) {
-                Limelog("Failed to decrypt video packet!\n");
-                continue;
+            // Decrypt the packet into the output buffer if encryption is enabled
+            if (encrypted) {
+                PENC_VIDEO_HEADER encHeader = (PENC_VIDEO_HEADER)encryptedBuffers[i];
+
+                // If this frame is below our current frame number, discard it before decryption
+                // to save CPU cycles decrypting FEC shards for a frame we already reassembled.
+                //
+                // Since this is happening _before_ decryption, this packet is not trusted yet.
+                // It's imperative that we do not mutate any state based on this packet until
+                // after it has been decrypted successfully!
+                //
+                // It's possible for an attacker to inject a fake packet that has any value of
+                // header fields they want, however this provides them no benefit because we will
+                // simply drop said packet here (if it's below the current frame number) or it
+                // will pass this check and be dropped during decryption (if contents is tampered)
+                // or after decryption in the RTP queue (if it's a replay of a previous authentic
+                // packet from the host).
+                //
+                // In short, an attacker spoofing this value via MITM or sending malicious values
+                // impersonating the host from off-link doesn't gain them anything. If they have
+                // a true MITM, they can DoS our connection by just dropping all our traffic, so
+                // tampering with packets to fail this check doesn't accomplish anything they
+                // couldn't already do. If they're not on-link, we just throw their malicious
+                // traffic away (as mentioned in the paragraph above) and continue accepting
+                // legitmate video traffic.
+                if (encHeader->frameNumber && LE32(encHeader->frameNumber) < RtpvGetCurrentFrameNumber(&rtpQueue)) {
+                    continue;
+                }
+
+                if (!PltDecryptMessage(decryptionCtx, ALGORITHM_AES_GCM, 0,
+                                       (unsigned char*)StreamConfig.remoteInputAesKey, sizeof(StreamConfig.remoteInputAesKey),
+                                       encHeader->iv, sizeof(encHeader->iv),
+                                       encHeader->tag, sizeof(encHeader->tag),
+                                       ((unsigned char*)(encHeader + 1)), err - sizeof(ENC_VIDEO_HEADER), // The ciphertext is after the header
+                                       (unsigned char*)buffer, &err)) {
+                    Limelog("Failed to decrypt video packet!\n");
+                    continue;
+                }
+            }
+
+            // Convert fields to host byte-order
+            packet = (PRTP_PACKET)&buffer[0];
+            packet->sequenceNumber = BE16(packet->sequenceNumber);
+            packet->timestamp = BE32(packet->timestamp);
+            packet->ssrc = BE32(packet->ssrc);
+
+            queueStatus = RtpvAddPacket(&rtpQueue, packet, err, (PRTPV_QUEUE_ENTRY)&buffer[decryptedSize]);
+
+            if (queueStatus == RTPF_RET_QUEUED) {
+                // The queue owns the buffer; allocate a fresh one next iteration
+                buffers[i] = NULL;
             }
         }
+    }
 
-        // Convert fields to host byte-order
-        packet = (PRTP_PACKET)&buffer[0];
-        packet->sequenceNumber = BE16(packet->sequenceNumber);
-        packet->timestamp = BE32(packet->timestamp);
-        packet->ssrc = BE32(packet->ssrc);
-
-        queueStatus = RtpvAddPacket(&rtpQueue, packet, err, (PRTPV_QUEUE_ENTRY)&buffer[decryptedSize]);
-
-        if (queueStatus == RTPF_RET_QUEUED) {
-            // The queue owns the buffer
-            buffer = NULL;
+Cleanup:
+    for (int i = 0; i < MAX_RECV_BATCH_SIZE; i++) {
+        if (buffers[i] != NULL) {
+            free(buffers[i]);
         }
-    }
-
-    if (buffer != NULL) {
-        free(buffer);
-    }
-
-    if (encryptedBuffer != NULL) {
-        free(encryptedBuffer);
+        if (encryptedBuffers[i] != NULL) {
+            free(encryptedBuffers[i]);
+        }
     }
 }
 
