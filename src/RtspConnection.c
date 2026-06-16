@@ -1063,7 +1063,25 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
         if ((StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_PYROWAVE) &&
                 (serverInfo->serverCodecModeSupport & SCM_MASK_PYROWAVE) &&
                 strstr(response.payload, "PYROWAVE/90000")) {
-            NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE;
+            // Priority mirrors the other codecs: HDR+4:4:4 > HDR(4:2:0) > SDR+4:4:4 > SDR(4:2:0).
+            // 4:4:4 is gated on the server's dedicated SCM flag (advertised only when the
+            // PyroWave encoder probe passed 4:4:4). 4:2:0 HDR has no separate server flag;
+            // if the client offered the 10-bit variant we request it (flips on
+            // dynamicRangeMode) and the server falls back to SDR if it can't do HDR.
+            if ((serverInfo->serverCodecModeSupport & SCM_PYROWAVE_HIGH10_444) &&
+                    (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_PYROWAVE_HIGH10_444)) {
+                NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE_HIGH10_444;
+            }
+            else if (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_PYROWAVE_MAIN10) {
+                NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE_MAIN10;
+            }
+            else if ((serverInfo->serverCodecModeSupport & SCM_PYROWAVE_HIGH8_444) &&
+                    (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_PYROWAVE_HIGH8_444)) {
+                NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE_HIGH8_444;
+            }
+            else {
+                NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE;
+            }
         }
         else if ((StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_AV1) && strstr(response.payload, "AV1/90000")) {
             if ((serverInfo->serverCodecModeSupport & SCM_AV1_MAIN10) && (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_AV1_MAIN10)) {

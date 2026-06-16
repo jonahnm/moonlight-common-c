@@ -454,6 +454,15 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
                 err |= addAttributeString(&optionHead, "x-nv-video[0].dynamicRangeMode", "0");
             }
 
+            // Request 4:4:4 chroma sampling when a 4:4:4 format was negotiated. This is a
+            // Sunshine extension (x-ss-video); the server reads it to drive its chroma path.
+            if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_YUV444) {
+                err |= addAttributeString(&optionHead, "x-ss-video[0].chromaSamplingType", "1");
+            }
+            else {
+                err |= addAttributeString(&optionHead, "x-ss-video[0].chromaSamplingType", "0");
+            }
+
             // If the decoder supports reference frame invalidation, that indicates it also supports
             // the maximum number of reference frames allowed by the codec. Even if we can't use RFI
             // due to lack of host support, we can still allow the host to pick a number of reference
