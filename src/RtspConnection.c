@@ -1067,7 +1067,7 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
                     (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_PYROWAVE_HIGH10_444)) {
                 NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE_HIGH10_444;
             }
-            else if ((serverInfo->serverCodecModeSupport & SCM_PYROWAVE_MAIN10) || (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_PYROWAVE_MAIN10)) {
+            else if (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_PYROWAVE_MAIN10) {
                 NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE_MAIN10;
             }
             else if ((serverInfo->serverCodecModeSupport & SCM_PYROWAVE_HIGH8_444) &&
