@@ -494,13 +494,17 @@ void LiInitializeConnectionCallbacks(PCONNECTION_LISTENER_CALLBACKS clCallbacks)
 #define SCM_HEVC        0x00100
 #define SCM_HEVC_MAIN10 0x00200
 #define SCM_AV1_MAIN8   0x10000 // Sunshine extension
-#define SCM_AV1_MAIN10  0x20000 // Sunshine extension
+#define SCM_AV1_MAIN10   0x20000 // Sunshine extension
+#define SCM_PYROWAVE            0x01000000 // PyroWave wavelet codec (8-bit SDR 4:2:0)
+#define SCM_PYROWAVE_HIGH8_444  0x02000000 // PyroWave wavelet codec (8-bit SDR 4:4:4)
+#define SCM_PYROWAVE_HIGH10_444 0x04000000 // PyroWave wavelet codec (10-bit HDR 4:4:4)
 
 // SCM masks to identify various codec capabilities
 #define SCM_MASK_H264   SCM_H264
 #define SCM_MASK_HEVC   (SCM_HEVC | SCM_HEVC_MAIN10)
 #define SCM_MASK_AV1    (SCM_AV1_MAIN8 | SCM_AV1_MAIN10)
-#define SCM_MASK_10BIT  (SCM_HEVC_MAIN10 | SCM_AV1_MAIN10)
+#define SCM_MASK_PYROWAVE (SCM_PYROWAVE | SCM_PYROWAVE_HIGH8_444 | SCM_PYROWAVE_HIGH10_444)
+#define SCM_MASK_10BIT  (SCM_HEVC_MAIN10 | SCM_AV1_MAIN10 | SCM_PYROWAVE_HIGH10_444)
 
 typedef struct _SERVER_INFORMATION {
     // Server host name or IP address in text form
