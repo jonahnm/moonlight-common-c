@@ -223,11 +223,16 @@ typedef struct _DECODE_UNIT {
 #define VIDEO_FORMAT_H265_MAIN10 0x0200 // HEVC Main10 Profile
 #define VIDEO_FORMAT_AV1_MAIN8   0x1000 // AV1 Main 8-bit profile
 #define VIDEO_FORMAT_AV1_MAIN10  0x2000 // AV1 Main 10-bit profile
+#define VIDEO_FORMAT_PYROWAVE             0x00010000 // PyroWave wavelet codec (8-bit SDR 4:2:0)
+#define VIDEO_FORMAT_PYROWAVE_MAIN10      0x00020000 // PyroWave wavelet codec (10-bit HDR 4:2:0)
+#define VIDEO_FORMAT_PYROWAVE_HIGH8_444   0x00040000 // PyroWave wavelet codec (8-bit SDR 4:4:4)
+#define VIDEO_FORMAT_PYROWAVE_HIGH10_444  0x00080000 // PyroWave wavelet codec (10-bit HDR 4:4:4)
 
 // Masks for clients to use to match video codecs without profile-specific details.
 #define VIDEO_FORMAT_MASK_H264  0x000F
 #define VIDEO_FORMAT_MASK_H265  0x0F00
-#define VIDEO_FORMAT_MASK_AV1   0xF000
+#define VIDEO_FORMAT_MASK_AV1      0xF000
+#define VIDEO_FORMAT_MASK_PYROWAVE 0x000F0000
 #define VIDEO_FORMAT_MASK_10BIT 0x2200
 
 // If set in the renderer capabilities field, this flag will cause audio/video data to
