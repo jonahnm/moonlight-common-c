@@ -1103,11 +1103,13 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
         else {
             NegotiatedVideoFormat = VIDEO_FORMAT_H264;
 
-            // Dimensions over 4096 are only supported with HEVC on NVENC
             if (StreamConfig.width > 4096 || StreamConfig.height > 4096) {
                 Limelog("WARNING: Host PC doesn't support HEVC. Streaming at resolutions above 4K using H.264 will likely fail!\n");
             }
         }
+
+        Limelog("RTSP: Negotiated video format 0x%x (client supported: 0x%x, server SCM: 0x%x)\n",
+                NegotiatedVideoFormat, StreamConfig.supportedVideoFormats, serverInfo->serverCodecModeSupport);
 
         // Look for the SDP attribute that indicates we're dealing with a server that supports RFI
         ReferenceFrameInvalidationSupported = strstr(response.payload, "x-nv-video[0].refPicInvalidation") != NULL;
